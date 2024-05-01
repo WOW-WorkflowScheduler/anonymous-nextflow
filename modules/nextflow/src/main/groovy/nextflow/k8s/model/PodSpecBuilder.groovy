@@ -16,6 +16,9 @@
 
 package nextflow.k8s.model
 
+import groovy.json.JsonOutput
+import groovy.json.JsonSlurper
+
 import java.nio.file.Path
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -74,6 +77,8 @@ class PodSpecBuilder {
 
     String workDir
 
+    String initWorkDir
+
     Integer cpus
 
     String memory
@@ -111,10 +116,16 @@ class PodSpecBuilder {
     boolean privileged
 
     int activeDeadlineSeconds
+    
+    String scheduler
 
     Map<String,List<String>> capabilities
 
     List<String> devices
+    
+    List<String> initCommand = []
+
+    String initImageName
 
     /**
      * @return A sequential volume unique identifier
@@ -140,6 +151,11 @@ class PodSpecBuilder {
 
     PodSpecBuilder withWorkDir( String path ) {
         this.workDir = path
+        return this
+    }
+
+    PodSpecBuilder withInitWorkDir( Path path ) {
+        this.initWorkDir = path.toString()
         return this
     }
 
@@ -314,6 +330,22 @@ class PodSpecBuilder {
     PodSpecBuilder withActiveDeadline(int seconds) {
         this.activeDeadlineSeconds = seconds
         return this
+	}
+        
+    PodSpecBuilder withScheduler( String scheduler ) {
+        this.scheduler = scheduler
+        return this
+    }
+
+    PodSpecBuilder withInitCommand( cmd ) {
+        assert cmd instanceof List || cmd instanceof CharSequence, "Missing or invalid K8s command parameter: $cmd"
+        this.initCommand = cmd instanceof List ? cmd : ['sh','-c', cmd.toString()]
+        return this
+    }
+
+    PodSpecBuilder withInitImageName(String name) {
+        this.initImageName = name
+        return this
     }
 
     PodSpecBuilder withPodOptions(PodOptions opts) {
@@ -340,6 +372,8 @@ class PodSpecBuilder {
         // -- volume claims 
         if( opts.getVolumeClaims() )
             volumeClaims.addAll( opts.getVolumeClaims() )
+        if( opts.getHostMount() )
+            hostMounts.addAll( opts.getHostMount() )
         // -- labels
         if( opts.labels ) {
             def keys = opts.labels.keySet()
@@ -384,7 +418,6 @@ class PodSpecBuilder {
     Map build() {
         assert this.podName, 'Missing K8s podName parameter'
         assert this.imageName, 'Missing K8s imageName parameter'
-        assert this.command || this.args, 'Missing K8s command parameter'
 
         final restart = this.restart ?: 'Never'
 
@@ -398,9 +431,19 @@ class PodSpecBuilder {
             env.add(entry.toSpec())
         }
 
-        final container = [ name: this.podName, image: this.imageName ]
+        final res = [:]
+        if( this.cpus )
+            res.cpu = this.cpus
+        if( this.memory )
+            res.memory = this.memory
+
+        final Map<String, Object> container = [
+                name: this.podName,
+                image: this.imageName
+        ] as Map<String, Object>
+
         if( this.command )
-            container.command = this.command
+            container.put('command', this.command)
         if( this.args )
             container.args = args
 
@@ -417,7 +460,7 @@ class PodSpecBuilder {
         if( privileged ) {
             // note: privileged flag needs to be defined in the *container* securityContext
             // not the 'spec' securityContext (see below)
-            secContext.privileged =true
+            secContext.privileged = true
         }
         if( capabilities ) {
             secContext.capabilities = capabilities
@@ -430,6 +473,20 @@ class PodSpecBuilder {
                 restartPolicy: restart,
                 containers: [ container ],
         ]
+
+        HashMap<String,Object> initContainer = null
+        if ( initCommand ){
+            initContainer = [
+                     name : "setup-environment",
+                     image: initImageName,
+                     command: initCommand
+             ]
+            spec.initContainers = [initContainer]
+            if( this.initWorkDir )
+                initContainer.put('workingDir', initWorkDir)
+            if( imagePullPolicy )
+                initContainer.imagePullPolicy = imagePullPolicy
+        }
 
         if( nodeSelector )
             spec.nodeSelector = nodeSelector.toSpec()
@@ -495,6 +552,11 @@ class PodSpecBuilder {
             container.resources = addDiskResources(this.disk, container.resources as Map)
         }
 
+        //scheduler
+        if( scheduler ){
+            spec.schedulerName = scheduler
+        }
+
         // add storage definitions ie. volumes and mounts
         final List<Map> mounts = []
         final List<Map> volumes = []
@@ -555,8 +617,11 @@ class PodSpecBuilder {
 
         if( volumes )
             spec.volumes = volumes
-        if( mounts )
+        if( mounts ){
             container.volumeMounts = mounts
+            if( initContainer )
+                initContainer.put('volumeMounts', new JsonSlurper().parseText(JsonOutput.toJson(mounts)))
+        }
 
         return pod
     }
@@ -695,6 +760,9 @@ class PodSpecBuilder {
         final config = [name: entry.configName]
         if( entry.configKey ) {
             config.items = [ [key: entry.configKey, path: entry.fileName ] ]
+        }
+        if( entry.defaultMode ) {
+            config.defaultMode = entry.defaultMode
         }
 
         mounts << [name: volName, mountPath: entry.mountPath]

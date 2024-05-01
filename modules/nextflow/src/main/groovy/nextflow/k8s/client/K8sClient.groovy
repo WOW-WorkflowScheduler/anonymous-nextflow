@@ -143,15 +143,15 @@ class K8sClient {
      * @param spec
      * @return
      */
-    K8sResponseJson podCreate(String req) {
+    K8sResponseJson podCreate(String req, namespace = config.namespace) {
         assert req
-        final action = "/api/v1/namespaces/$config.namespace/pods"
+        final action = "/api/v1/namespaces/$namespace/pods"
         final resp = post(action, req)
         trace('POST', action, resp.text)
         return new K8sResponseJson(resp.text)
     }
 
-    K8sResponseJson podCreate(Map req, Path saveYamlPath=null) {
+    K8sResponseJson podCreate(Map req, Path saveYamlPath=null, namespace = config.namespace) {
 
         if( saveYamlPath ) try {
             saveYamlPath.text = new Yaml().dump(req).toString()
@@ -160,7 +160,7 @@ class K8sClient {
             log.debug "WARN: unable to save request yaml -- cause: ${e.message ?: e}"
         }
 
-        podCreate(JsonOutput.toJson(req))
+        podCreate(JsonOutput.toJson(req), namespace)
     }
 
     /**
@@ -352,6 +352,13 @@ class K8sClient {
         assert podName
         final K8sResponseJson resp = podStatus0(podName)
         (resp?.spec as Map)?.nodeName as String
+	}
+
+    String podIP( String podName ){
+        assert podName
+        final resp = podStatus(podName)
+        return (resp?.status as Map)?.podIP
+
     }
 
     /**
@@ -377,6 +384,7 @@ class K8sClient {
      *
      *
      */
+
     Map jobState( String jobName ) {
         assert jobName
         final podName = findPodNameForJob(jobName)
@@ -511,6 +519,35 @@ class K8sClient {
         }
 
         throw new K8sResponseException("K8s undetermined status conditions for pod $podName", resp)
+    }
+
+    K8sResponseJson daemonSetCreate(Map req, Path saveYamlPath=null) {
+
+        if( saveYamlPath )
+            try {
+                saveYamlPath.text = new Yaml().dump(req).toString()
+            }
+            catch( Exception e ) {
+                log.debug "WARN: unable to save request yaml -- cause: ${e.message ?: e}"
+            }
+
+        daemonSetCreate(JsonOutput.toJson(req))
+    }
+
+    K8sResponseJson daemonSetCreate(String req) {
+        assert req
+        final action = "/apis/apps/v1/namespaces/$config.namespace/daemonsets"
+        final resp = post(action, req)
+        trace('POST', action, resp.text)
+        new K8sResponseJson(resp.text)
+    }
+
+    K8sResponseJson daemonSetDelete(String name) {
+        assert name
+        final action = "/apis/apps/v1/namespaces/$config.namespace/daemonsets/$name"
+        final resp = delete(action)
+        trace('DELETE', action, resp.text)
+        new K8sResponseJson(resp.text)
     }
 
     protected void checkInvalidWaitingState( Map waiting, K8sResponseJson resp ) {
@@ -661,6 +698,8 @@ class K8sClient {
         log.trace "[K8s] API request $method $path ${body ? '\n'+prettyPrint(body).indent() : ''}"
 
         if( body ) {
+            //Fix problem for large config maps send to the API Server
+            conn.setChunkedStreamingMode( 1024 * 256 )
             conn.setDoOutput(true);
             conn.setDoInput(true);
             conn.getOutputStream() << body
@@ -671,7 +710,7 @@ class K8sClient {
         final isError = code >= 400
         final stream = isError ? conn.getErrorStream() : conn.getInputStream()
         if( isError )
-            throw new K8sResponseException("Request $method $path returned an error code=$code", stream)
+            throw new K8sResponseException("Request $method $path returned an error code=$code", stream, code)
         return new K8sResponseApi(code, stream)
     }
 
@@ -699,6 +738,18 @@ class K8sClient {
                 kind: 'ConfigMap',
                 metadata: [ name: name, namespace: config.namespace ],
                 data: data
+        ]
+
+        configCreate0(spec)
+    }
+
+    K8sResponseJson configCreateBinary(String name, Map data) {
+
+        final spec = [
+                apiVersion: 'v1',
+                kind: 'ConfigMap',
+                metadata: [ name: name, namespace: config.namespace ],
+                binaryData: data
         ]
 
         configCreate0(spec)

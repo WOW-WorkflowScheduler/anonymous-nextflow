@@ -16,6 +16,8 @@
 
 package nextflow.processor
 
+import com.google.common.hash.HashCode
+
 import java.nio.file.Path
 
 import groovy.transform.CompileStatic
@@ -54,6 +56,8 @@ class TaskBean implements Serializable, Cloneable {
     Path workDir
 
     Path targetDir
+
+    Path localWorkDir
 
     String script
 
@@ -101,6 +105,8 @@ class TaskBean implements Serializable, Cloneable {
     boolean secretNative
 
     List<String> secretNames
+    
+    HashCode hash
 
     Map<String,String> resourceLabels
 
@@ -154,6 +160,8 @@ class TaskBean implements Serializable, Cloneable {
         this.binDirs = task.getProcessor().getBinDirs()
         this.stageInMode = task.config.getStageInMode()
         this.stageOutMode = task.config.getStageOutMode()
+        this.hash = task.hash
+        this.localWorkDir = null
 
         this.resourceLabels = task.config.getResourceLabels()
     }

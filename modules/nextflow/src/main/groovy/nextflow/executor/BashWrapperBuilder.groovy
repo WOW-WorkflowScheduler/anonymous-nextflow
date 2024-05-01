@@ -157,7 +157,7 @@ class BashWrapperBuilder {
     }
 
     protected boolean shouldUnstageOutputs() {
-        return targetDir && workDir!=targetDir
+        return (targetDir && workDir!=targetDir) || localWorkDir
     }
 
     protected boolean fixOwnership() {
@@ -270,6 +270,8 @@ class BashWrapperBuilder {
         binding.conda_activate = getCondaActivateSnippet()
         binding.spack_activate = getSpackActivateSnippet()
 
+        binding.K8sResolveSymlinks = null
+
         /*
          * add the task environment
          */
@@ -310,7 +312,7 @@ class BashWrapperBuilder {
         binding.unstage_controls = changeDir || shouldUnstageOutputs() ? getUnstageControls() : null
 
         if( changeDir || shouldUnstageOutputs() ) {
-            binding.unstage_outputs = copyStrategy.getUnstageOutputFilesScript(outputFiles,targetDir)
+            binding.unstage_outputs = copyStrategy.getUnstageOutputFilesScript(outputFiles,localWorkDir ?: targetDir)
         }
         else {
             binding.unstage_outputs = null

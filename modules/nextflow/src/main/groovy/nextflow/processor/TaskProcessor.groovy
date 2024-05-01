@@ -15,6 +15,9 @@
  */
 package nextflow.processor
 
+import nextflow.file.LocalFileWalker
+import nextflow.k8s.localdata.LocalPath
+
 import static nextflow.processor.ErrorStrategy.*
 
 import java.lang.reflect.InvocationTargetException
@@ -745,7 +748,7 @@ class TaskProcessor {
 
     /**
      * Try to check if exists a previously executed process result in the a cached folder. If it exists
-     * use the that result and skip the process execution, otherwise the task is sumitted for execution.
+     * use the that result and skip the process execution, otherwise the task is submitted for execution.
      *
      * @param task
      *      The {@code TaskRun} instance to be executed
@@ -761,7 +764,7 @@ class TaskProcessor {
     @CompileStatic
     final protected void checkCachedOrLaunchTask( TaskRun task, HashCode hash, boolean shouldTryCache ) {
 
-        int tries = task.failCount +1
+        int tries = task.failCount + task.initFailCount + 1
         while( true ) {
             hash = CacheHelper.defaultHasher().newHasher().putBytes(hash.asBytes()).putInt(tries).hash()
 
@@ -992,12 +995,13 @@ class TaskProcessor {
             if( error instanceof Error ) throw error
 
             // -- retry without increasing the error counts
-            if( task && (error.cause instanceof ProcessRetryableException || error.cause instanceof CloudSpotTerminationException) ) {
-                if( error.cause instanceof ProcessRetryableException )
+            if( task && (error.cause instanceof ProcessRetryableException || error instanceof ProcessRetryableException || error.cause instanceof CloudSpotTerminationException ) ) {
+                if( error.cause instanceof ProcessRetryableException || error instanceof ProcessRetryableException )
                     log.info "[$task.hashLog] NOTE: ${error.message} -- Execution is retried"
                 else
                     log.info "[$task.hashLog] NOTE: ${error.message} -- Cause: ${error.cause.message} -- Execution is retried"
-                task.failCount+=1
+                if ( task.initialized ) task.failCount+=1
+                else task.initFailCount+=1
                 final taskCopy = task.makeCopy()
                 session.getExecService().submit {
                     try {
@@ -1014,8 +1018,21 @@ class TaskProcessor {
                 return RETRY
             }
 
-            final int taskErrCount = task ? ++task.failCount : 0
-            final int procErrCount = ++errorCount
+            final int taskErrCount
+            final int procErrCount
+            final int initErrCount
+            if ( task?.withInit && !task?.initialized ) {
+                taskErrCount = task.failCount
+                initErrCount = ++task.initFailCount
+                procErrCount = errorCount
+            } else {
+                taskErrCount = task ? ++task.failCount : 0
+                initErrCount = task ? task.initFailCount : 0
+                procErrCount = ++errorCount
+            }
+            String logMessage = "${safeTaskName(task)}: errorCount: $procErrCount, retryCount: $taskErrCount"
+            if ( task?.withInit ) logMessage += ", initCount: $initErrCount"
+            log.info( logMessage )
 
             // -- when is a task level error and the user has chosen to ignore error,
             //    just report and error message and DO NOT stop the execution
@@ -1024,12 +1041,16 @@ class TaskProcessor {
                 task.config.exitStatus = task.exitStatus
                 task.config.errorCount = procErrCount
                 task.config.retryCount = taskErrCount
+                task.config.initCount = initErrCount
 
-                errorStrategy = checkErrorStrategy(task, error, taskErrCount, procErrCount)
+                errorStrategy = checkErrorStrategy(task, error, taskErrCount, procErrCount, initErrCount)
                 if( errorStrategy.soft ) {
                     def msg = "[$task.hashLog] NOTE: $error.message"
                     if( errorStrategy == IGNORE ) msg += " -- Error is ignored"
-                    else if( errorStrategy == RETRY ) msg += " -- Execution is retried ($taskErrCount)"
+                    else if( errorStrategy == RETRY ) {
+                        if( !task.initialized ) msg += " -- InitError is ignored"
+                        msg += " -- Execution is retried (${task.config.getAttempt()})"
+                    }
                     log.info msg
                     task.failed = true
                     task.errorAction = errorStrategy
@@ -1084,9 +1105,9 @@ class TaskProcessor {
                 : name
     }
 
-    protected ErrorStrategy checkErrorStrategy( TaskRun task, ProcessException error, final int taskErrCount, final int procErrCount ) {
+    protected ErrorStrategy checkErrorStrategy( TaskRun task, ProcessException error, final int taskErrCount, final int procErrCount, final int initErrCount = 0 ) {
 
-        final action = task.config.getErrorStrategy()
+        final action = !task.initialized ? RETRY : task.config.getErrorStrategy()
 
         // retry is not allowed when the script cannot be compiled or similar errors
         if( error instanceof ProcessUnrecoverableException ) {
@@ -1102,12 +1123,15 @@ class TaskProcessor {
         if( action == RETRY ) {
             final int maxErrors = task.config.getMaxErrors()
             final int maxRetries = task.config.getMaxRetries()
+            final int maxInitRetries = task.config.getMaxInitRetries()
 
-            if( (procErrCount < maxErrors || maxErrors == -1) && taskErrCount <= maxRetries ) {
+            if( ( !task.initialized && initErrCount <= maxInitRetries)
+                    ||
+                ( task.initialized && (procErrCount < maxErrors || maxErrors == -1) && taskErrCount <= maxRetries )) {
                 final taskCopy = task.makeCopy()
                 session.getExecService().submit({
                     try {
-                        taskCopy.config.attempt = taskErrCount+1
+                        taskCopy.config.attempt = taskCopy.config.attempt ? taskCopy.config.attempt + 1 : 2
                         taskCopy.runType = RunType.RETRY
                         taskCopy.resolve(taskBody)
                         checkCachedOrLaunchTask( taskCopy, taskCopy.hash, false )
@@ -1566,11 +1590,19 @@ class TaskProcessor {
             else {
                 def path = param.glob ? splitter.strip(filePattern) : filePattern
                 def file = workDir.resolve(path)
-                def exists = param.followLinks ? file.exists() : file.exists(LinkOption.NOFOLLOW_LINKS)
+                def origFile = file
+                def outfiles = workDir.resolve( ".command.outfiles" ).toFile()
+                def exists
+                if( outfiles.exists() ){
+                    file = LocalFileWalker.exists( outfiles, file, workDir, param.followLinks ? LinkOption.NOFOLLOW_LINKS : null )
+                    exists = file != null
+                } else {
+                    exists = param.followLinks ? file.exists() : file.exists(LinkOption.NOFOLLOW_LINKS)
+                }
                 if( exists )
                     result = [file]
                 else
-                    log.debug "Process `${safeTaskName(task)}` is unable to find [${file.class.simpleName}]: `$file` (pattern: `$filePattern`)"
+                    log.debug "Process `${safeTaskName(task)}` is unable to find [${origFile.class.simpleName}]: `$file` (pattern: `$filePattern`)"
             }
 
             if( result )
@@ -1682,7 +1714,8 @@ class TaskProcessor {
 
         for( int i=0; i<collectedFiles.size(); i++ ) {
             final it = collectedFiles.get(i)
-            final relName = workDir.relativize(it).toString()
+            //Error, if it is not of the same type as workDir
+            final relName = workDir.relativize(it instanceof LocalPath ? it.fakePath() : it).toString()
             if( !allStaged.contains(relName) )
                 result.add(it)
         }

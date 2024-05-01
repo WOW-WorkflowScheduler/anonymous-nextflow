@@ -183,6 +183,7 @@ abstract class TaskHandler {
         record.disk = task.config.getDisk()?.toBytes()
         record.time = task.config.getTime()?.toMillis()
         record.env = task.getEnvironmentStr()
+        record.out_label = task.config.getOutLabel()?.getLabel()
         record.executorName = task.processor.executor.getName()
 
         if( isCompleted() ) {
@@ -211,6 +212,17 @@ abstract class TaskHandler {
             }
             catch( IOException e ) {
                 log.debug "[WARN] Cannot read trace file: $file -- Cause: ${e.message}"
+            }
+
+            file = task.workDir?.resolve(TaskRun.CMD_TRACE_SCHEDULER)
+            try {
+                if(file) record.parseSchedulerTraceFile(file)
+            }
+            catch( NoSuchFileException e ) {
+                // ignore it
+            }
+            catch( IOException e ) {
+                log.debug "[WARN] Cannot read scheduler trace file: $file -- Cause: ${e.message}"
             }
         }
 

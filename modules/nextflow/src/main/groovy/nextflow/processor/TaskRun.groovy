@@ -305,6 +305,21 @@ class TaskRun implements Cloneable {
     volatile int failCount
 
     /**
+     * The number of times the initialization of the task has failed
+     */
+    volatile int initFailCount
+
+    /**
+     * Mark task as using init
+     */
+    volatile boolean withInit = false
+
+    /**
+     * Mark task as initialized; default true, as most environments do not initialize tasks
+     */
+    volatile boolean initialized = true
+
+    /**
      * Mark the task as failed
      */
     volatile boolean failed
@@ -344,6 +359,8 @@ class TaskRun implements Cloneable {
         copy.id = TaskId.next()
         copy.name = null // <-- force to re-evaluate the name that can include a dynamic tag
         copy.error = null
+        if ( withInit ) copy.initialized = false
+        if ( initialized ) copy.initFailCount = 0 // <-- start counting anew if it was initialized once successfully.
         copy.exitStatus = Integer.MAX_VALUE
         return copy
     }
@@ -549,7 +566,10 @@ class TaskRun implements Cloneable {
     static final public String CMD_RUN = '.command.run'
     static final public String CMD_STAGE = '.command.stage'
     static final public String CMD_TRACE = '.command.trace'
+    static final public String CMD_TRACE_SCHEDULER = '.command.scheduler.trace'
     static final public String CMD_ENV = '.command.env'
+    static final public String CMD_INIT_LOG = '.command.init.log'
+    static final public String CMD_INIT_RUN = '.command.init.run'
 
 
     String toString( ) {

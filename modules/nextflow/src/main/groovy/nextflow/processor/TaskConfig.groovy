@@ -304,6 +304,11 @@ class TaskConfig extends LazyMap implements Cloneable {
         result ? result as int : defResult
     }
 
+    int getMaxInitRetries() {
+        def result = get('maxInitRetries')
+        result ? result as int : 5
+    }
+
     int getMaxErrors() {
         def result = get('maxErrors')
         result ? result as int : 0
@@ -354,7 +359,7 @@ class TaskConfig extends LazyMap implements Cloneable {
 
     List<PublishDir> getPublishDir() {
         def dirs = get('publishDir')
-        if( !dirs ) {
+        if( !dirs || target.skipPublishDir ) {
             return Collections.emptyList()
         }
 
@@ -375,6 +380,11 @@ class TaskConfig extends LazyMap implements Cloneable {
 
     def getContainer() {
         return get('container')
+    }
+    
+    OutLabel getOutLabel(){
+        final def params = get("outLabel")
+        params ? new OutLabel( params as Map ) : null
     }
 
     Architecture getArchitecture() {

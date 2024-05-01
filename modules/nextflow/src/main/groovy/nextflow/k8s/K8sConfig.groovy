@@ -27,11 +27,15 @@ import nextflow.exception.AbortOperationException
 import nextflow.k8s.client.ClientConfig
 import nextflow.k8s.client.K8sClient
 import nextflow.k8s.client.K8sResponseException
+import nextflow.k8s.model.PodHostMount
+import nextflow.k8s.model.PodNodeSelector
 import nextflow.k8s.model.PodOptions
 import nextflow.k8s.model.PodSecurityContext
 import nextflow.k8s.model.PodVolumeClaim
 import nextflow.k8s.model.ResourceType
 import nextflow.util.Duration
+import nextflow.processor.TaskRun
+import java.nio.file.Path
 
 /**
  * Model Kubernetes specific settings defined in the nextflow
@@ -57,6 +61,12 @@ class K8sConfig implements Map<String,Object> {
             final mount = getStorageMountPath()
             final subPath = getStorageSubPath()
             this.podOptions.volumeClaims.add(new PodVolumeClaim(name, mount, subPath))
+        }
+
+        if( getLocalPath() ) {
+            final name = getLocalPath()
+            final mount = getLocalStorageMountPath()
+            this.podOptions.hostMount.add( new PodHostMount(name, mount) )
         }
 
         // -- shortcut to pod image pull-policy
@@ -97,6 +107,14 @@ class K8sConfig implements Map<String,Object> {
         new K8sDebug( (Map<String,Object>)get('debug') )
     }
 
+    K8sScheduler getScheduler(){
+        target.scheduler || locationAwareScheduling() ? new K8sScheduler( (Map<String,Object>)target.scheduler ) : null
+    }
+
+    Storage getStorage() {
+        locationAwareScheduling() ? new Storage( (Map<String,Object>)target.storage, getLocalClaimPaths() ) : null
+    }
+
     boolean getCleanup(boolean defValue=true) {
         target.cleanup == null ? defValue : Boolean.valueOf( target.cleanup as String )
     }
@@ -109,8 +127,16 @@ class K8sConfig implements Map<String,Object> {
         target.storageClaimName as String
     }
 
+    String getLocalPath() {
+        target.localPath as String
+    }
+
     String getStorageMountPath() {
         target.storageMountPath ?: '/workspace' as String
+    }
+
+    String getLocalStorageMountPath() {
+        target.localStorageMountPath ?: '/workspace' as String
     }
 
     String getStorageSubPath() {
@@ -174,6 +200,10 @@ class K8sConfig implements Map<String,Object> {
         Boolean.valueOf( target.autoMountHostPaths as String )
     }
 
+    boolean locationAwareScheduling() {
+        getLocalClaimPaths().size() > 0
+    }
+
     PodOptions getPodOptions() {
         podOptions
     }
@@ -194,6 +224,10 @@ class K8sConfig implements Map<String,Object> {
         podOptions.volumeClaims.collect { it.mountPath }
     }
 
+    Collection<String> getLocalClaimPaths() {
+        podOptions.hostMount.collect { it.mountPath }
+    }
+
     /**
      * Find a volume claim name given the mount path
      *
@@ -203,6 +237,11 @@ class K8sConfig implements Map<String,Object> {
     String findVolumeClaimByPath(String path) {
         def result = podOptions.volumeClaims.find { path.startsWith(it.mountPath) }
         return result ? result.claimName : null
+    }
+
+    String findLocalVolumeClaimByPath(String path) {
+        def result = podOptions.hostMount.find { path.startsWith(it.mountPath) }
+        return result ? result.hostPath : null
     }
 
     @Memoized
@@ -260,7 +299,7 @@ class K8sConfig implements Map<String,Object> {
         ClientConfig.discover(contextName, namespace, serviceAccount)
     }
 
-    void checkStorageAndPaths(K8sClient client) {
+    void checkStorageAndPaths(K8sClient client, String pipelineName) {
         if( !getStorageClaimName() )
             throw new AbortOperationException("Missing K8s storage volume claim -- The name of a persistence volume claim needs to be provided in the nextflow configuration file")
 
@@ -287,6 +326,12 @@ class K8sConfig implements Map<String,Object> {
         if( !findVolumeClaimByPath(getProjectDir()) )
             throw new AbortOperationException("Kubernetes `projectDir` must be a path mounted as a persistent volume -- projectDir=$projectDir; volumes=${getClaimPaths().join(', ')}")
 
+        //The nextflow project/workflow has to be on a shared drive
+        if ( pipelineName && pipelineName[0] == '/' && !findVolumeClaimByPath(pipelineName) )
+            throw new AbortOperationException("Kubernetes `pipelineName` must be a path mounted as a persistent volume -- projectDir=$pipelineName; volumes=${getClaimPaths().join(', ')}")
+
+        if( getStorage() && !findLocalVolumeClaimByPath(getStorage().getWorkdir()) )
+            throw new AbortOperationException("Kubernetes `storage.workdir` must be a path mounted as a local volume -- storage.workdir=${getStorage().getWorkdir()}; volumes=${getLocalClaimPaths().join(', ')}")
 
     }
 
@@ -301,6 +346,113 @@ class K8sConfig implements Map<String,Object> {
         }
 
         boolean getYaml() { Boolean.valueOf( target.yaml as String ) }
+    }
+
+    @CompileStatic
+    static class K8sScheduler {
+
+        @Delegate
+        Map<String,Object> target
+
+        K8sScheduler(Map<String,Object> scheduler) {
+            this.target = scheduler
+        }
+
+        String getName() { target.name as String ?: 'workflow-scheduler' }
+
+        String getStrategy() { target.strategy as String ?: 'FIFO' }
+
+        String getServiceAccount() { target.serviceAccount as String }
+
+        String getImagePullPolicy() { target.imagePullPolicy as String }
+
+        Integer getCPUs() { target.cpu as Integer ?: 1 }
+
+        String getMemory() { target.memory as String ?: "1400Mi" }
+
+        String getContainer() { target.container as String }
+
+        String getCommand() { target.command as String }
+
+        Integer getPort() { target.port as Integer ?: 8080 }
+
+        String getWorkDir() { target.workDir as String }
+
+        Integer runAsUser() { target.runAsUser as Integer }
+
+        Boolean autoClose() { target.autoClose == null ? true : target.autoClose as Boolean }
+
+        String getCostFunction() { target.costFunction as String }
+
+        Integer getMaxCopyTasksPerNode() { target.maxCopyTasksPerNode as Integer }
+
+        Integer getMaxWaitingCopyTasksPerNode() { target.maxWaitingCopyTasksPerNode as Integer }
+
+        PodNodeSelector getNodeSelector(){
+            return target.nodeSelector ? new PodNodeSelector( target.nodeSelector ) : null
+        }
+
+        int getBatchSize() {
+            String s = target.batchSize as String
+            //Default: 1 -> No batching
+            s ? Integer.valueOf(s) : 1
+        }
+
+    }
+
+    @CompileStatic
+    static class Storage {
+
+
+        @Delegate
+        Map<String,Object> target
+        Collection<String> localClaims
+
+        Storage(Map<String,Object> scheduler, Collection<String> localClaims ) {
+            this.target = scheduler
+            this.localClaims = localClaims
+        }
+
+        String getCopyStrategy() {
+            target.copyStrategy as String ?: 'ftp'
+        }
+
+        String getWorkdir() {
+            Path workdir = (target.workdir ?: localClaims[0]) as Path
+            if( ! workdir.getName().equalsIgnoreCase('localWork') ){
+                workdir = workdir.resolve( 'localWork' )
+            }
+            return workdir.toString()
+        }
+
+        PodNodeSelector getNodeSelector(){
+            return target.nodeSelector ? new PodNodeSelector( target.nodeSelector ) : null
+        }
+
+        boolean deleteIntermediateData(){
+            target.deleteIntermediateData as Boolean ?: false
+        }
+
+        String getImageName() {
+            target.imageName
+        }
+
+        String getCmd() {
+            target.cmd as String ?: "./$TaskRun.CMD_INIT_RUN"
+        }
+
+        boolean withInitContainers() {
+            return "true".equalsIgnoreCase(target.initContainers as String)
+        }
+
+        /**
+         * If copy process is not running together with the main pod. If this is set, initContainers will be ignored
+         * @return
+         */
+        boolean separateCopy() {
+            return true
+        }
+
     }
 }
 

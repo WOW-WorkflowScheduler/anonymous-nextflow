@@ -16,6 +16,9 @@
 
 package nextflow.k8s
 
+import nextflow.extension.GroupKey
+import org.codehaus.groovy.runtime.GStringImpl
+
 import java.nio.file.Files
 import java.nio.file.Path
 import java.time.Instant
@@ -43,6 +46,8 @@ import nextflow.processor.TaskStatus
 import nextflow.trace.TraceRecord
 import nextflow.util.Escape
 import nextflow.util.PathTrie
+import nextflow.file.FileHolder
+import nextflow.k8s.client.K8sSchedulerClient
 /**
  * Implements the {@link TaskHandler} interface for Kubernetes pods
  *
@@ -69,6 +74,8 @@ class K8sTaskHandler extends TaskHandler implements FusionAwareTask {
 
     private K8sClient client
 
+    private K8sSchedulerClient schedulerClient
+
     private String podName
 
     private BashWrapperBuilder builder
@@ -76,6 +83,8 @@ class K8sTaskHandler extends TaskHandler implements FusionAwareTask {
     private Path outputFile
 
     private Path errorFile
+
+    private Path initLogs
 
     private Path exitFile
 
@@ -87,14 +96,30 @@ class K8sTaskHandler extends TaskHandler implements FusionAwareTask {
 
     private String runsOnNode = null
 
+    private boolean initContainer = false
+
+    private boolean initFinished = true
+    
+    private Integer initError = null
+
+    private long createBashWrapperTime = -1
+
+    private long createRequestTime = -1
+
+    private long submitToSchedulerTime = -1
+
+    private long submitToK8sTime = -1
+
     K8sTaskHandler( TaskRun task, K8sExecutor executor ) {
         super(task)
         this.executor = executor
         this.client = executor.client
+        this.schedulerClient = executor.schedulerClient
         this.outputFile = task.workDir.resolve(TaskRun.CMD_OUTFILE)
         this.errorFile = task.workDir.resolve(TaskRun.CMD_ERRFILE)
         this.exitFile = task.workDir.resolve(TaskRun.CMD_EXIT)
         this.resourceType = executor.k8sConfig.useJobResource() ? ResourceType.Job : ResourceType.Pod
+        this.initLogs = task.workDir.resolve(TaskRun.CMD_INIT_LOG)
     }
 
     /** only for testing -- do not use */
@@ -113,7 +138,7 @@ class K8sTaskHandler extends TaskHandler implements FusionAwareTask {
         return podName
     }
 
-    protected K8sConfig getK8sConfig() { executor.getK8sConfig() }
+    protected K8sConfig getK8sConfig() { executor?.getK8sConfig() }
 
     protected boolean useJobResource() { resourceType==ResourceType.Job }
 
@@ -143,7 +168,7 @@ class K8sTaskHandler extends TaskHandler implements FusionAwareTask {
     protected BashWrapperBuilder createBashWrapper(TaskRun task) {
         return fusionEnabled()
                 ? fusionLauncher()
-                : new K8sWrapperBuilder(task)
+                : new K8sWrapperBuilder( task , k8sConfig.getStorage() )
     }
 
     protected List<String> classicSubmitCli(TaskRun task) {
@@ -214,6 +239,22 @@ class K8sTaskHandler extends TaskHandler implements FusionAwareTask {
         }
         else {
             builder.withCommand(launcher)
+        }
+
+        final def schedulerConf = executor?.getK8sConfig()?.getScheduler()
+        if ( schedulerConf )
+            builder.withScheduler( "${schedulerConf.getName()}-${getRunName()}" )
+
+        final def storage = executor?.getK8sConfig()?.getStorage()
+        if ( storage ){
+            task.initialized = !storage.withInitContainers() || storage.separateCopy()
+            task.withInit = storage.withInitContainers() && !storage.separateCopy()
+            if ( storage.withInitContainers() && !storage.separateCopy() ) {
+                builder.withInitImageName( storage.getImageName() )
+                builder.withInitWorkDir( task.workDir )
+                Boolean traceEnabled = Boolean.valueOf( executor.session.config.navigate('trace.enabled') as String )
+                builder.withInitCommand( ['bash',"-c", "${storage.getCmd().strip()} $traceEnabled".toString()] )
+            }
         }
 
         // note: task environment is managed by the task bash wrapper
@@ -293,19 +334,102 @@ class K8sTaskHandler extends TaskHandler implements FusionAwareTask {
         k8sConfig.getAnnotations()
     }
 
+    @CompileDynamic
+    private void extractValue(
+            List<Object> booleanInputs,
+            List<Object> numberInputs,
+            List<Object> stringInputs,
+            List<Object> fileInputs,
+            String key,
+            Object input
+    ){
+        if ( input == null ) {
+            return
+        } else if( input instanceof Collection ){
+            input.forEach { extractValue(booleanInputs, numberInputs, stringInputs, fileInputs, key, it) }
+        } else if( input instanceof Map ) {
+            input.entrySet().forEach { extractValue(booleanInputs, numberInputs, stringInputs, fileInputs, key + it.key, it.value) }
+        } else if ( input instanceof GroupKey ) {
+            extractValue( booleanInputs, numberInputs, stringInputs, fileInputs, key, input.target )
+        } else if( input instanceof FileHolder ){
+            fileInputs.add([ name : key, value : [ storePath : input.storePath.toString(), sourceObj : input.sourceObj.toString(), stageName : input.stageName.toString() ]])
+        } else if( input instanceof Path ){
+            fileInputs.add([ name : key, value : [ storePath : input.toAbsolutePath().toString(), sourceObj : input.toAbsolutePath().toString(), stageName : input.fileName.toString() ]])
+        } else if ( input instanceof Boolean ) {
+            booleanInputs.add( [ name : key, value : input] )
+        } else if ( input instanceof Number ) {
+            numberInputs.add( [ name : key, value : input] )
+        } else if ( input instanceof String ) {
+            stringInputs.add( [ name : key, value : input] )
+        } else if ( input instanceof GStringImpl ) {
+            stringInputs.add( [ name : key, value : ((GStringImpl) input).toString()] )
+        } else {
+            log.error ( "input was of class ${input.class}: $input")
+            throw new IllegalArgumentException( "Task input was of class and cannot be parsed: ${input.class}: $input" )
+        }
+
+    }
+
+    private Map registerTask(){
+
+        final List<Object> booleanInputs = new LinkedList<>()
+        final List<Object> numberInputs = new LinkedList<>()
+        final List<Object> stringInputs = new LinkedList<>()
+        final List<Object> fileInputs = new LinkedList<>()
+
+        for ( entry in task.getInputs() ){
+            extractValue( booleanInputs, numberInputs, stringInputs, fileInputs, entry.getKey().name , entry.getValue() )
+        }
+
+        Map config = [
+                runName : "nf-${task.hash}",
+                inputs : [
+                        booleanInputs : booleanInputs,
+                        numberInputs  : numberInputs,
+                        stringInputs  : stringInputs,
+                        fileInputs    : fileInputs
+                ],
+                schedulerParams : [:],
+                name : task.name,
+                task : task.processor.name,
+                stageInMode : task.getConfig().stageInMode,
+                cpus : task.config.getCpus(),
+                memoryInBytes : task.config.getMemory()?.toBytes(),
+                workDir : task.getWorkDirStr(),
+                outLabel : task.config.getOutLabel()?.toMap()
+        ]
+
+
+        return schedulerClient.registerTask( config, task.id.intValue() )
+
+    }
+
     /**
      * Creates a new K8s pod executing the associated task
      */
     @Override
     @CompileDynamic
     void submit() {
+        long start = System.currentTimeMillis()
         builder = createBashWrapper(task)
         builder.build()
+        createBashWrapperTime = System.currentTimeMillis() - start
 
+        start = System.currentTimeMillis()
         final req = newSubmitRequest(task)
+        createRequestTime = System.currentTimeMillis() - start
+
+		if( schedulerClient ) {
+            start = System.currentTimeMillis()
+            registerTask()
+            submitToSchedulerTime = System.currentTimeMillis() - start
+        }
+
+        start = System.currentTimeMillis()
         final resp = useJobResource()
                 ? client.jobCreate(req, yamlDebugPath())
                 : client.podCreate(req, yamlDebugPath())
+        submitToK8sTime = System.currentTimeMillis() - start
 
         if( !resp.metadata?.name )
             throw new K8sResponseException("Missing created ${resourceType.lower()} name", resp)
@@ -355,6 +479,17 @@ class K8sTaskHandler extends TaskHandler implements FusionAwareTask {
     boolean checkIfRunning() {
         if( !podName ) throw new IllegalStateException("Missing K8s ${resourceType.lower()} name -- cannot check if running")
         if(isSubmitted()) {
+            if ( task && !task.initialized ){
+                Map state = schedulerClient.getTaskState(task.id.intValue())
+                if( [ "PREPARED", "FINISHED", "DELETED"].contains( state.state.toString() ) ){
+                    task.initialized = true
+                } else if ( [ "INIT_WITH_ERRORS" ].contains( state.state.toString() ) ) {
+                    initError = 1
+                    return false
+                } else {
+                    return false
+                }
+            }
             def state = getState()
             // include `terminated` state to allow the handler status to progress
             if (state && (state.running != null || state.terminated)) {
@@ -396,11 +531,23 @@ class K8sTaskHandler extends TaskHandler implements FusionAwareTask {
         }
     }
 
+    boolean schedulerPostProcessingHasFinished(){
+        Map state = schedulerClient.getTaskState(task.id.intValue())
+        return (!state.state) ?: ["FINISHED", "FINISHED_WITH_ERROR", "INIT_WITH_ERRORS", "DELETED"].contains( state.state.toString() )
+    }
+
     @Override
     boolean checkIfCompleted() {
         if( !podName ) throw new IllegalStateException("Missing K8s ${resourceType.lower()} name - cannot check if complete")
         def state = getState()
-        if( state && state.terminated ) {
+        if ( initError ){
+            log.info( "InitContainer failed" )
+            task.exitStatus = initError
+            task.stdout = initLogs
+            status = TaskStatus.COMPLETED
+            return true
+        }
+        if( state && state.terminated && ( !k8sConfig?.locationAwareScheduling() || schedulerPostProcessingHasFinished() ) ) {
             if( state.nodeTermination instanceof NodeTerminationException ||
                 state.nodeTermination instanceof PodUnschedulableException ) {
                 // keep track of the node termination error
@@ -517,6 +664,10 @@ class K8sTaskHandler extends TaskHandler implements FusionAwareTask {
         final result = super.getTraceRecord()
         result.put('native_id', podName)
         result.put( 'hostname', runsOnNode )
+        result.put(  "create_bash_wrapper_time", createBashWrapperTime )
+        result.put(  "create_request_time", createRequestTime )
+        result.put(  "submit_to_scheduler_time", submitToSchedulerTime )
+        result.put(  "submit_to_k8s_time", submitToK8sTime )
         return result
     }
 
